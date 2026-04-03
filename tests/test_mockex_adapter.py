@@ -2,7 +2,7 @@
 
 import pytest
 import json
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from exchange.mockex import MockexAdapter
 from core.models import Order, Balance, Position, Trade
@@ -10,7 +10,10 @@ from core.models import Order, Balance, Position, Trade
 
 @pytest.fixture
 def adapter():
-    return MockexAdapter(base_url="http://localhost:3000")
+    """Create adapter with a mocked session (simulates post-connect state)."""
+    a = MockexAdapter(base_url="http://localhost:3000")
+    a._session = MagicMock()  # simulate connected state
+    return a
 
 
 def _mock_response(data, status=200):
@@ -24,25 +27,19 @@ def _mock_response(data, status=200):
     return resp
 
 
-def _mock_session(response):
-    """Create a mock aiohttp ClientSession."""
-    session = MagicMock()
-    session.get = MagicMock(return_value=response)
-    session.post = MagicMock(return_value=response)
-    session.delete = MagicMock(return_value=response)
-    session.__aenter__ = AsyncMock(return_value=session)
-    session.__aexit__ = AsyncMock(return_value=False)
-    return session
+def _set_mock_session(adapter, response):
+    """Configure the adapter's mock session to return the given response."""
+    adapter._session.get = MagicMock(return_value=response)
+    adapter._session.post = MagicMock(return_value=response)
+    adapter._session.delete = MagicMock(return_value=response)
 
 
 @pytest.mark.asyncio
 async def test_get_balance(adapter):
     data = {"cash": "50000.00", "reserved": "5000.00", "equity": "100000.00", "position_value": "45000.00"}
-    resp = _mock_response(data)
-    session = _mock_session(resp)
+    _set_mock_session(adapter, _mock_response(data))
 
-    with patch("aiohttp.ClientSession", return_value=session):
-        balance = await adapter.get_balance()
+    balance = await adapter.get_balance()
 
     assert isinstance(balance, Balance)
     assert balance.cash == 50000.0
@@ -57,11 +54,9 @@ async def test_get_position_exists(adapter):
         "quantity": "0.01", "entry_price": "95000.00",
         "unrealized_pnl": "5.00", "current_price": "95500.00",
     }
-    resp = _mock_response(data)
-    session = _mock_session(resp)
+    _set_mock_session(adapter, _mock_response(data))
 
-    with patch("aiohttp.ClientSession", return_value=session):
-        pos = await adapter.get_position()
+    pos = await adapter.get_position()
 
     assert isinstance(pos, Position)
     assert pos.quantity == 0.01
@@ -70,11 +65,9 @@ async def test_get_position_exists(adapter):
 
 @pytest.mark.asyncio
 async def test_get_position_none(adapter):
-    resp = _mock_response({})
-    session = _mock_session(resp)
+    _set_mock_session(adapter, _mock_response({}))
 
-    with patch("aiohttp.ClientSession", return_value=session):
-        pos = await adapter.get_position()
+    pos = await adapter.get_position()
 
     assert pos is None
 
@@ -88,15 +81,21 @@ async def test_place_order(adapter):
         "price": None, "stop_price": None,
         "created_at": "2026-04-03T00:00:00", "updated_at": "2026-04-03T00:00:00",
     }
-    resp = _mock_response(data, status=201)
-    session = _mock_session(resp)
+    _set_mock_session(adapter, _mock_response(data, status=201))
 
-    with patch("aiohttp.ClientSession", return_value=session):
-        order = await adapter.place_order("buy", "market", 0.005)
+    order = await adapter.place_order("buy", "market", 0.005)
 
     assert isinstance(order, Order)
     assert order.id == "abc-123"
     assert order.status == "filled"
+
+
+@pytest.mark.asyncio
+async def test_place_order_error(adapter):
+    _set_mock_session(adapter, _mock_response({"error": "Insufficient balance"}, status=400))
+
+    with pytest.raises(ValueError, match="Insufficient balance"):
+        await adapter.place_order("buy", "market", 999)
 
 
 @pytest.mark.asyncio
@@ -108,14 +107,20 @@ async def test_cancel_order(adapter):
         "price": "94000.00", "stop_price": None,
         "created_at": "2026-04-03T00:00:00", "updated_at": "2026-04-03T00:00:01",
     }
-    resp = _mock_response(data)
-    session = _mock_session(resp)
+    _set_mock_session(adapter, _mock_response(data))
 
-    with patch("aiohttp.ClientSession", return_value=session):
-        order = await adapter.cancel_order("abc-123")
+    order = await adapter.cancel_order("abc-123")
 
     assert isinstance(order, Order)
     assert order.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_cancel_order_error(adapter):
+    _set_mock_session(adapter, _mock_response({"error": "Order not found"}, status=404))
+
+    with pytest.raises(ValueError, match="Order not found"):
+        await adapter.cancel_order("nonexistent")
 
 
 @pytest.mark.asyncio
@@ -129,11 +134,9 @@ async def test_get_open_orders(adapter):
             "created_at": "2026-04-03T00:00:00", "updated_at": None,
         },
     ]
-    resp = _mock_response(data)
-    session = _mock_session(resp)
+    _set_mock_session(adapter, _mock_response(data))
 
-    with patch("aiohttp.ClientSession", return_value=session):
-        orders = await adapter.get_open_orders()
+    orders = await adapter.get_open_orders()
 
     assert len(orders) == 1
     assert isinstance(orders[0], Order)
@@ -149,12 +152,18 @@ async def test_get_trades(adapter):
             "fee": "4.76", "realized_pnl": "0", "executed_at": "2026-04-03T00:00:00",
         },
     ]
-    resp = _mock_response(data)
-    session = _mock_session(resp)
+    _set_mock_session(adapter, _mock_response(data))
 
-    with patch("aiohttp.ClientSession", return_value=session):
-        trades = await adapter.get_trades()
+    trades = await adapter.get_trades()
 
     assert len(trades) == 1
     assert isinstance(trades[0], Trade)
     assert trades[0].price == 95200.0
+
+
+@pytest.mark.asyncio
+async def test_not_connected_raises():
+    adapter = MockexAdapter(base_url="http://localhost:3000")
+    # _session is None (not connected)
+    with pytest.raises(RuntimeError, match="Not connected"):
+        await adapter.get_balance()

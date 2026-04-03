@@ -22,9 +22,21 @@ class MockexAdapter(BaseExchange):
         self._base_url = base_url.rstrip("/")
         self._ws = None
         self._ws_task = None
+        self._session: aiohttp.ClientSession | None = None
 
     async def connect(self) -> None:
         log.info("Connecting to mockex at %s", self._base_url)
+        self._session = aiohttp.ClientSession()
+        # Verify mockex is reachable
+        try:
+            async with self._session.get(f"{self._base_url}/api/account") as resp:
+                if resp.status >= 500:
+                    raise ConnectionError(f"mockex returned status {resp.status}")
+            log.info("Verified mockex is reachable")
+        except Exception as e:
+            await self._session.close()
+            self._session = None
+            raise ConnectionError(f"Cannot reach mockex at {self._base_url}: {e}") from e
 
     async def disconnect(self) -> None:
         if self._ws_task:
@@ -37,7 +49,16 @@ class MockexAdapter(BaseExchange):
         if self._ws:
             await self._ws.close()
             self._ws = None
+        if self._session:
+            await self._session.close()
+            self._session = None
         log.info("Disconnected from mockex")
+
+    def _get_session(self) -> aiohttp.ClientSession:
+        """Return the shared HTTP session, raising if not connected."""
+        if self._session is None:
+            raise RuntimeError("Not connected — call connect() first")
+        return self._session
 
     async def place_order(
         self, side: str, order_type: str, quantity: float,
@@ -49,55 +70,55 @@ class MockexAdapter(BaseExchange):
         if stop_price is not None:
             body["stop_price"] = stop_price
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(f"{self._base_url}/api/orders", json=body) as resp:
-                data = await resp.json()
-                if resp.status >= 400:
-                    raise ValueError(data.get("error", "Order failed"))
-                return self._parse_order(data)
+        session = self._get_session()
+        async with session.post(f"{self._base_url}/api/orders", json=body) as resp:
+            data = await resp.json()
+            if resp.status >= 400:
+                raise ValueError(data.get("error", "Order failed"))
+            return self._parse_order(data)
 
     async def cancel_order(self, order_id: str) -> Order:
-        async with aiohttp.ClientSession() as session:
-            async with session.delete(f"{self._base_url}/api/orders/{order_id}") as resp:
-                data = await resp.json()
-                if resp.status >= 400:
-                    raise ValueError(data.get("error", "Cancel failed"))
-                return self._parse_order(data)
+        session = self._get_session()
+        async with session.delete(f"{self._base_url}/api/orders/{order_id}") as resp:
+            data = await resp.json()
+            if resp.status >= 400:
+                raise ValueError(data.get("error", "Cancel failed"))
+            return self._parse_order(data)
 
     async def get_balance(self) -> Balance:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{self._base_url}/api/account") as resp:
-                data = await resp.json()
-                return Balance(
-                    cash=float(data.get("cash", 0)),
-                    reserved=float(data.get("reserved", 0)),
-                    position_value=float(data.get("position_value", 0)),
-                )
+        session = self._get_session()
+        async with session.get(f"{self._base_url}/api/account") as resp:
+            data = await resp.json()
+            return Balance(
+                cash=float(data.get("cash", 0)),
+                reserved=float(data.get("reserved", 0)),
+                position_value=float(data.get("position_value", 0)),
+            )
 
     async def get_position(self) -> Position | None:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{self._base_url}/api/positions") as resp:
-                data = await resp.json()
-                if not data or not data.get("symbol"):
-                    return None
-                return Position(
-                    symbol=data["symbol"],
-                    side=data["side"],
-                    quantity=float(data["quantity"]),
-                    entry_price=float(data["entry_price"]),
-                )
+        session = self._get_session()
+        async with session.get(f"{self._base_url}/api/positions") as resp:
+            data = await resp.json()
+            if not data or not data.get("symbol"):
+                return None
+            return Position(
+                symbol=data["symbol"],
+                side=data["side"],
+                quantity=float(data["quantity"]),
+                entry_price=float(data["entry_price"]),
+            )
 
     async def get_open_orders(self) -> list[Order]:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{self._base_url}/api/orders", params={"status": "open"}) as resp:
-                data = await resp.json()
-                return [self._parse_order(o) for o in data]
+        session = self._get_session()
+        async with session.get(f"{self._base_url}/api/orders", params={"status": "open"}) as resp:
+            data = await resp.json()
+            return [self._parse_order(o) for o in data]
 
     async def get_trades(self) -> list[Trade]:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{self._base_url}/api/trades") as resp:
-                data = await resp.json()
-                return [self._parse_trade(t) for t in data]
+        session = self._get_session()
+        async with session.get(f"{self._base_url}/api/trades") as resp:
+            data = await resp.json()
+            return [self._parse_trade(t) for t in data]
 
     async def subscribe_market_data(self, callback: Callable) -> None:
         """Connect to mockex WebSocket and stream market data + trading events."""
